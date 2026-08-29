@@ -76,6 +76,8 @@ struct Args {
     fly: bool,
     hud: bool,
     blocks: Blocks,
+    ss: usize,
+    ao: f32,
     bench: usize,
     screenshot: Option<String>,
     record: Option<String>,
@@ -101,6 +103,8 @@ impl Default for Args {
             fly: false,
             hud: false,
             blocks: Blocks::Quad,
+            ss: 0, // 0 = 端末の広さから自動で決める
+            ao: 0.55,
             bench: 0,
             screenshot: None,
             record: None,
@@ -131,6 +135,9 @@ sl-real — 端末を走る 3D 蒸気機関車
   --hud             速度などの情報を重ねる
   --blocks <mode>   quad = 1 セル 2x2 ピクセル（既定・横解像度が倍）
                     half = 1 セル 1x2 ピクセル（字形の対応が広い）
+  --ss <auto|1-3>   スーパーサンプリング倍率。2 で輪郭が滑らかになる
+                    既定の auto は端末の広さを見て 2 か 1 を選ぶ
+  --ao <0-1.5>      アンビエントオクルージョンの強さ (既定 0.55、0 で切る)
   --screenshot <f>  1 枚だけ PPM に書き出して終わる (--at 秒 / --size ピクセル)
   --record <前置き> 連番 PPM を書き出す (--frames 枚数 / --fps)
   --term <桁x行>    書き出しを端末と同じ格子・同じ画角で行う
@@ -165,6 +172,15 @@ fn parse_args() -> Result<Args, String> {
             "--seed" => a.seed = val()?.parse().map_err(|_| "--seed が数値ではありません")?,
             "--fly" | "-F" => a.fly = true,
             "--hud" => a.hud = true,
+            "--ss" => {
+                let v = val()?;
+                a.ss = if v == "auto" {
+                    0
+                } else {
+                    v.parse().map_err(|_| "--ss は auto か数値です")?
+                };
+            }
+            "--ao" => a.ao = val()?.parse().map_err(|_| "--ao が数値ではありません")?,
             "--blocks" => {
                 let v = val()?;
                 a.blocks = match v.as_str() {
@@ -198,6 +214,8 @@ fn parse_args() -> Result<Args, String> {
     }
     a.cars = a.cars.min(12);
     a.fps = a.fps.clamp(1, 120);
+    a.ss = a.ss.min(3);
+    a.ao = a.ao.clamp(0.0, 1.5);
     Ok(a)
 }
 
@@ -228,10 +246,32 @@ fn local_hour() -> f32 {
     ((secs % 86400) as f32 / 3600.0 + off).rem_euclid(24.0)
 }
 
+/// `--ss auto` のときの倍率。画素数が増えすぎない範囲で 2 を使う。
+fn auto_ss(args: &Args, cols: usize, rows: usize) -> usize {
+    if args.ss > 0 {
+        return args.ss;
+    }
+    let px = match args.blocks {
+        Blocks::Half => cols * rows * 2,
+        Blocks::Quad => cols * 2 * rows * 2,
+    };
+    // 使えるコア数に見合った画素数までなら 2 倍で描く。
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 16);
+    if px <= 56_000 * cores / 16 {
+        2
+    } else {
+        1
+    }
+}
+
 /// 書き出し用のレンダラ。`--term` があれば端末とまったく同じ格子で作る。
 fn offline_renderer(args: &Args, default_px: (usize, usize)) -> Renderer {
     if let Some((c, r)) = args.term {
-        return Renderer::for_terminal(c.max(4), r.max(2), args.blocks);
+        let (c, r) = (c.max(4), r.max(2));
+        return Renderer::for_terminal(c, r, args.blocks, auto_ss(args, c, r));
     }
     let (w, h) = if args.shot_w > 0 { (args.shot_w, args.shot_h) } else { default_px };
     let mut r = Renderer::new(w, h);
@@ -312,6 +352,7 @@ struct World {
     hour: f32,
     clouds: f32,
     fly: f32,
+    ao: f32,
 }
 
 impl World {
@@ -333,6 +374,9 @@ impl World {
         r.clear();
         r.cam_pos = view.eye;
         r.cam_right = view.right;
+        r.cam_fwd = view.fwd;
+        r.cam_up = view.up;
+        r.tan_half = (view.fov * 0.5).tan();
         let proj = M4::perspective(view.fov, r.aspect(), 0.06);
         let vm = M4::look_at(view.eye, view.eye + view.fwd, v3(0.0, 1.0, 0.0));
         r.set_view(proj.mul(&vm));
@@ -373,6 +417,9 @@ impl World {
                 b.pop();
             }
         }
+
+        // ---- 遮蔽。煙を重ねる前に、不透明な面だけに効かせる。
+        r.ssao(self.ao, 0.42);
 
         // ---- 前照灯の光芒（夜のみ）。
         if r.env.head_power > 0.0 {
@@ -430,6 +477,7 @@ fn run(args: Args) -> std::io::Result<()> {
         hour,
         clouds: args.clouds,
         fly: 0.0,
+        ao: args.ao,
     };
     w.t.speed = args.speed;
     w.t.pos = START_X;
@@ -469,9 +517,13 @@ fn run(args: Args) -> std::io::Result<()> {
     if args.bench > 0 {
         // ベンチは端末の桁数・行数で指定する（--size 200x50 = 200 桁 50 行）。
         let (cols, rows) = if args.shot_w > 0 { (args.shot_w, args.shot_h) } else { (200, 50) };
-        let mut r = Renderer::for_terminal(cols, rows, args.blocks);
+        let mut r = Renderer::for_terminal(cols, rows, args.blocks, auto_ss(&args, cols, rows));
         let mut buf = String::with_capacity(1 << 20);
         let dt = 1.0 / 60.0;
+        // 煙が出そろった状態で測る。序盤だけだと実走より軽く見えてしまう。
+        for _ in 0..(4.0 / dt) as usize {
+            w.step(dt, args.fly);
+        }
         let start = Instant::now();
         for _ in 0..args.bench {
             w.step(dt, args.fly);
@@ -506,7 +558,7 @@ fn run(args: Args) -> std::io::Result<()> {
     let clamp_size = |c: u16, r: u16| (c.max(20) as usize, r.max(6) as usize);
     let (mut cols, mut rows) = terminal::size().unwrap_or((100, 30));
     let (mut tc, mut tr) = clamp_size(cols, rows);
-    let mut r = Renderer::for_terminal(tc, tr, args.blocks);
+    let mut r = Renderer::for_terminal(tc, tr, args.blocks, auto_ss(&args, tc, tr));
     let mut buf = String::with_capacity(1 << 20);
 
     let mut cam = args.cam;
