@@ -145,11 +145,30 @@ fn reject(a: &[f32; 4], b: &[f32; 4], c: &[f32; 4]) -> bool {
         || (a[1] > a[3] && b[1] > b[3] && c[1] > c[3])
 }
 
-/// 頂点を切り出したクリップ空間の一時データ。
+/// クリップ空間の頂点。陰影は画素ごとに解くので、
+/// ここではワールド座標・法線・素材色をそのまま運ぶ。
 #[derive(Clone, Copy)]
 struct ClipV {
     pos: [f32; 4],
+    p: V3,
+    n: V3,
     c: V3,
+}
+
+impl ClipV {
+    #[inline]
+    fn lerp(&self, o: &ClipV, t: f32) -> ClipV {
+        let mut pos = [0.0f32; 4];
+        for k in 0..4 {
+            pos[k] = self.pos[k] + (o.pos[k] - self.pos[k]) * t;
+        }
+        ClipV {
+            pos,
+            p: self.p.lerp(o.p, t),
+            n: self.n.lerp(o.n, t),
+            c: self.c.lerp(o.c, t),
+        }
+    }
 }
 
 /// 陰影付け前に溜めておく三角形。法線の縮退はこの時点で解決済み。
@@ -179,13 +198,20 @@ struct Sprite {
     seed: f32,
 }
 
-/// 画面空間まで落とした三角形。色は 1/w を掛けた遠近補正済みの値。
+/// 画面空間まで落とした三角形。
+/// 属性は 1/w を掛けた空間で補間するため、あらかじめ掛けてある。
 #[derive(Clone, Copy)]
 struct ScreenTri {
     x: [f32; 3],
     y: [f32; 3],
     iw: [f32; 3],
+    /// ワールド座標。
+    p: [V3; 3],
+    /// 法線。
+    n: [V3; 3],
+    /// 素材色。
     c: [V3; 3],
+    mat: Material,
     y0: f32,
     y1: f32,
 }
@@ -423,9 +449,8 @@ impl Renderer {
         }
         let threads = threads();
 
-        // ---- 第 1 段：頂点の陰影付け → 画面空間の三角形へ。
-        let env = self.env;
-        let cam = self.cam_pos;
+        // ---- 第 1 段：近クリップして画面空間へ落とす。
+        // 陰影は画素ごとに解くので、ここでは座標と法線を運ぶだけ。
         let (w, h) = (self.w as f32, self.h as f32);
         let tris = std::mem::take(&mut self.tris);
         let chunk = tris.len().div_ceil(threads).max(1);
@@ -437,19 +462,12 @@ impl Renderer {
                 handles.push(scope.spawn(move || {
                     let mut out: Vec<ScreenTri> = Vec::with_capacity(part.len() + 4);
                     for t in part {
-                        let mut v = [ClipV { pos: [0.0; 4], c: V3::ZERO }; 3];
-                        for i in 0..3 {
-                            // 影の箱は地面用。物体自身に当てると自分の影で真っ黒になる。
-                            let lit =
-                                shade_of(&env, cam, t.p[i], t.n[i], t.c[i], &t.mat, 0.0);
-                            let d = t.p[i] - cam;
-                            let dist = d.len();
-                            v[i] = ClipV {
-                                pos: t.clip[i],
-                                c: fog_of(&env, lit, dist, d / dist.max(1e-6)),
-                            };
-                        }
-                        clip_and_project(&v, w, h, &mut out);
+                        let v = [
+                            ClipV { pos: t.clip[0], p: t.p[0], n: t.n[0], c: t.c[0] },
+                            ClipV { pos: t.clip[1], p: t.p[1], n: t.n[1], c: t.c[1] },
+                            ClipV { pos: t.clip[2], p: t.p[2], n: t.n[2], c: t.c[2] },
+                        ];
+                        clip_and_project(&v, w, h, &t.mat, &mut out);
                     }
                     out
                 }));
@@ -475,6 +493,8 @@ impl Renderer {
 
         let sw = self.w;
         let scr: &[ScreenTri] = &screen;
+        let env = self.env;
+        let cam = self.cam_pos;
         std::thread::scope(|scope| {
             let mut y0 = 0usize;
             let mut idx = 0usize;
@@ -487,10 +507,11 @@ impl Renderer {
                 y0 += band_h;
                 let list: &[u32] = if idx < bucket.len() { &bucket[idx] } else { &[] };
                 idx += 1;
+                let env = &env;
                 scope.spawn(move || {
                     let rows = cc.len() / sw;
                     for &i in list {
-                        raster_band(&scr[i as usize], cc, dd, sw, start, rows);
+                        raster_band(&scr[i as usize], cc, dd, sw, start, rows, env, cam);
                     }
                 });
             }
@@ -654,20 +675,27 @@ impl Renderer {
             depth[y * w + x]
         };
 
+        // 遮蔽はゆるやかにしか変わらないので、縦横 1/2 の解像度で解いて
+        // 最後に補間して戻す。見た目は変わらず手間は 1/4 になる。
+        let (aw, ah) = ((w / 2).max(1), (h / 2).max(1));
         // 円周上に半径を変えて散らした固定パターン。回転で縞を散らす。
         const N: usize = 10;
-        let mut ao = vec![0.0f32; w * h];
-        let band = h.div_ceil(threads()).max(1);
+        let mut ao = vec![V3::ZERO; aw * ah];
+        let band = ah.div_ceil(threads()).max(1);
         std::thread::scope(|scope| {
             let mut y0 = 0usize;
-            for part in ao.chunks_mut(w * band) {
+            for part in ao.chunks_mut(aw * band) {
                 let start = y0;
                 y0 += band;
                 let world = &world;
                 let at = &at;
                 scope.spawn(move || {
                     for (i, out) in part.iter_mut().enumerate() {
-                        let (py, px) = (start + i / w, i % w);
+                        let (ay, ax) = (start + i / aw, i % aw);
+                        let (px, py) = (ax * 2, ay * 2);
+                        if py >= h || px >= w {
+                            continue;
+                        }
                         let dc = depth[py * w + px];
                         if !dc.is_finite() {
                             continue;
@@ -676,13 +704,13 @@ impl Renderer {
                         let p = world(fx, fy, dc);
 
                         // 隣の画素との差から法線を作る。深度が飛ぶ縁では諦める。
-                        let dx = at(px as i64 + 1, py as i64);
-                        let dy = at(px as i64, py as i64 + 1);
+                        let dx = at(px as i64 + 2, py as i64);
+                        let dy = at(px as i64, py as i64 + 2);
                         if !dx.is_finite() || !dy.is_finite() {
                             continue;
                         }
-                        let pu = world(fx + 1.0, fy, dx) - p;
-                        let pv = world(fx, fy + 1.0, dy) - p;
+                        let pu = world(fx + 2.0, fy, dx) - p;
+                        let pv = world(fx, fy + 2.0, dy) - p;
                         let mut n = pv.cross(pu).norm();
                         if n.dot(n) < 0.5 {
                             continue;
@@ -694,7 +722,7 @@ impl Renderer {
 
                         // 半径をワールド単位で決め、画面上の大きさに直す。
                         let ry = radius * (h as f32 * 0.5) / (th * dc.max(0.05));
-                        if ry < 0.7 {
+                        if ry < 1.4 {
                             continue;
                         }
                         let ry = ry.min(h as f32 * 0.12);
@@ -728,29 +756,37 @@ impl Renderer {
                             let fall = 1.0 / (1.0 + (len / radius).powi(2));
                             occ += cosw * fall;
                         }
-                        *out = saturate(occ / N as f32 * 2.6);
+                        *out = V3::splat(saturate(occ / N as f32 * 2.6));
                     }
                 });
             }
         });
 
         // サンプルのばらつきをならす。
-        let mut tmp = vec![V3::ZERO; w * h];
-        let mut a3: Vec<V3> = ao.iter().map(|&v| V3::splat(v)).collect();
-        let rb = (2.0 / pxa).round() as usize;
-        blur_h(&a3, &mut tmp, w, h, rb);
-        blur_v(&tmp, &mut a3, w, h, 2);
+        let mut tmp = vec![V3::ZERO; aw * ah];
+        let rb = (1.0 / pxa).round().max(1.0) as usize;
+        blur_h(&ao, &mut tmp, aw, ah, rb);
+        blur_v(&tmp, &mut ao, aw, ah, 1);
 
+        // 補間して等倍へ戻し、色に掛ける。
         let band = h.div_ceil(threads()).max(1);
-        let src: &[V3] = &a3;
+        let src: &[V3] = &ao;
         std::thread::scope(|scope| {
-            let mut idx = 0usize;
+            let mut ystart = 0usize;
             for part in self.color.chunks_mut(w * band) {
-                let start = idx;
-                idx += w * band;
+                let start = ystart;
+                ystart += band;
                 scope.spawn(move || {
                     for (i, c) in part.iter_mut().enumerate() {
-                        let k = 1.0 - src[start + i].x * strength;
+                        let (y, x) = (start + i / w, i % w);
+                        let fy = (y as f32 * 0.5 - 0.25).clamp(0.0, ah as f32 - 1.001);
+                        let fx = (x as f32 * 0.5 - 0.25).clamp(0.0, aw as f32 - 1.001);
+                        let (y0, ty) = (fy as usize, fy.fract());
+                        let (x0, tx) = (fx as usize, fx.fract());
+                        let (x1, y1) = ((x0 + 1).min(aw - 1), (y0 + 1).min(ah - 1));
+                        let a = src[y0 * aw + x0].lerp(src[y0 * aw + x1], tx);
+                        let b = src[y1 * aw + x0].lerp(src[y1 * aw + x1], tx);
+                        let k = 1.0 - a.lerp(b, ty).x * strength;
                         *c = *c * k.max(0.0);
                     }
                 });
@@ -1115,7 +1151,8 @@ pub fn shadow_of(boxes: &[(V3, V3)], sun: V3, p: V3) -> f32 {
 pub fn fog_of(env: &Env, c: V3, dist: f32, dir: V3) -> V3 {
     let f = 1.0 - (-dist * env.fog_density).exp();
     // 太陽方向の霧はほんのり明るい。
-    let glow = saturate(dir.dot(env.sun_dir)).powf(4.0);
+    let g = saturate(dir.dot(env.sun_dir));
+    let glow = g * g * g * g;
     let fog_col = env.horizon_color.lerp(env.sun_color, glow * 0.5);
     c.lerp(fog_col, f)
 }
@@ -1145,19 +1182,23 @@ pub fn shade_of(
     lit += albedo.mul3(amb) * 0.55;
 
     // Blinn-Phong のハイライト。金属は素材色に着色する。
-    let hv = (e.sun_dir + view).norm();
-    let shin = 2.0 / (m.rough * m.rough + 1e-3) + 2.0;
-    let spec = saturate(n.dot(hv)).powf(shin) * (1.0 - m.rough) * vis * ndl.max(0.0);
     let spec_tint = V3::splat(1.0).lerp(albedo, m.metal);
-    lit += spec_tint.mul3(e.sun_color) * (spec * (0.32 + m.metal * 0.85));
+    let hv = (e.sun_dir + view).norm();
+    let ndh = saturate(n.dot(hv));
+    let shin = 2.0 / (m.rough * m.rough + 1e-3) + 2.0;
+    // 指数が大きいので、少し外れただけでほぼ 0 になる。そこは計算しない。
+    if ndh * ndh > 0.25 || shin < 12.0 {
+        let spec = ndh.powf(shin) * (1.0 - m.rough) * vis * ndl.max(0.0);
+        lit += spec_tint.mul3(e.sun_color) * (spec * (0.32 + m.metal * 0.85));
+    }
 
     // 空と地面の映り込み。黒い車体に立体感を与えるのはほぼこれ。
     let refl = n * (2.0 * n.dot(view)) - view;
     let ry = refl.y;
     let env_col = if ry >= 0.0 {
-        e.horizon_color.lerp(e.zenith_color, saturate(ry).powf(0.45))
+        e.horizon_color.lerp(e.zenith_color, saturate(ry).sqrt())
     } else {
-        e.horizon_color.lerp(e.ground_color, saturate(-ry).powf(0.45))
+        e.horizon_color.lerp(e.ground_color, saturate(-ry).sqrt())
     };
     // ざらついた面ほど反射はぼやけ、彩度も落ちる。
     let env_lum = env_col.x * 0.2126 + env_col.y * 0.7152 + env_col.z * 0.0722;
@@ -1241,7 +1282,7 @@ fn blur_v(src: &[V3], dst: &mut [V3], w: usize, h: usize, r: usize) {
 }
 
 /// 近クリップ面で切り、残りを扇状に分割して画面空間へ落とす。
-fn clip_and_project(v: &[ClipV; 3], w: f32, h: f32, out: &mut Vec<ScreenTri>) {
+fn clip_and_project(v: &[ClipV; 3], w: f32, h: f32, mat: &Material, out: &mut Vec<ScreenTri>) {
     const NEAR_W: f32 = 0.05;
     let inside = |x: &ClipV| x.pos[3] > NEAR_W;
     let n_in = v.iter().filter(|x| inside(x)).count();
@@ -1249,12 +1290,13 @@ fn clip_and_project(v: &[ClipV; 3], w: f32, h: f32, out: &mut Vec<ScreenTri>) {
         return;
     }
     if n_in == 3 {
-        if let Some(t) = project(&v[0], &v[1], &v[2], w, h) {
+        if let Some(t) = project(&v[0], &v[1], &v[2], w, h, mat) {
             out.push(t);
         }
         return;
     }
-    let mut poly: [ClipV; 4] = [ClipV { pos: [0.0; 4], c: V3::ZERO }; 4];
+    let zero = ClipV { pos: [0.0; 4], p: V3::ZERO, n: V3::ZERO, c: V3::ZERO };
+    let mut poly: [ClipV; 4] = [zero; 4];
     let mut n = 0usize;
     for i in 0..3 {
         let cur = v[i];
@@ -1266,23 +1308,19 @@ fn clip_and_project(v: &[ClipV; 3], w: f32, h: f32, out: &mut Vec<ScreenTri>) {
         }
         if ci != ni {
             let t = (NEAR_W - cur.pos[3]) / (nxt.pos[3] - cur.pos[3]);
-            let mut p = [0.0f32; 4];
-            for k in 0..4 {
-                p[k] = cur.pos[k] + (nxt.pos[k] - cur.pos[k]) * t;
-            }
-            poly[n] = ClipV { pos: p, c: cur.c.lerp(nxt.c, t) };
+            poly[n] = cur.lerp(&nxt, t);
             n += 1;
         }
     }
     for i in 1..n.saturating_sub(1) {
-        if let Some(t) = project(&poly[0], &poly[i], &poly[i + 1], w, h) {
+        if let Some(t) = project(&poly[0], &poly[i], &poly[i + 1], w, h, mat) {
             out.push(t);
         }
     }
 }
 
 /// クリップ空間 → 画面空間。面積がゼロなら捨てる。
-fn project(a: &ClipV, b: &ClipV, c: &ClipV, w: f32, h: f32) -> Option<ScreenTri> {
+fn project(a: &ClipV, b: &ClipV, c: &ClipV, w: f32, h: f32, mat: &Material) -> Option<ScreenTri> {
     let sp = |v: &ClipV| -> (f32, f32, f32) {
         let iw = 1.0 / v.pos[3];
         (
@@ -1302,14 +1340,20 @@ fn project(a: &ClipV, b: &ClipV, c: &ClipV, w: f32, h: f32) -> Option<ScreenTri>
         x: [x0, x1, x2],
         y: [y0, y1, y2],
         iw: [w0, w1, w2],
-        // 遠近補正のために色は 1/w を掛けた空間で補間する。
+        // 遠近補正のため、属性は 1/w を掛けた空間で補間する。
+        p: [a.p * w0, b.p * w1, c.p * w2],
+        n: [a.n * w0, b.n * w1, c.n * w2],
         c: [a.c * w0, b.c * w1, c.c * w2],
+        mat: *mat,
         y0: y0.min(y1).min(y2),
         y1: y0.max(y1).max(y2),
     })
 }
 
 /// 1 本の横帯だけを塗る。`buf`/`depth` は帯の先頭からのスライス。
+/// 陰影は画素ごとに解く。頂点で解いて補間するより高いが、
+/// ハイライトと映り込みが面の上で正しく曲がる。
+#[allow(clippy::too_many_arguments)]
 fn raster_band(
     t: &ScreenTri,
     buf: &mut [V3],
@@ -1317,14 +1361,16 @@ fn raster_band(
     w: usize,
     band_y0: usize,
     band_rows: usize,
+    env: &Env,
+    cam: V3,
 ) {
     let (x0, x1, x2) = (t.x[0], t.x[1], t.x[2]);
     let (y0, y1, y2) = (t.y[0], t.y[1], t.y[2]);
     let area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
     let inv_area = 1.0 / area;
 
-    let min_x = t.x[0].min(x1).min(x2).floor().max(0.0) as usize;
-    let max_x = (t.x[0].max(x1).max(x2).ceil() as i64).min(w as i64 - 1);
+    let min_x = x0.min(x1).min(x2).floor().max(0.0) as usize;
+    let max_x = (x0.max(x1).max(x2).ceil() as i64).min(w as i64 - 1);
     if max_x < 0 || min_x >= w {
         return;
     }
@@ -1334,7 +1380,6 @@ fn raster_band(
         return;
     }
 
-    let (ca, cb, cc) = (t.c[0], t.c[1], t.c[2]);
     let (w0, w1, w2) = (t.iw[0], t.iw[1], t.iw[2]);
 
     for py in lo..=(hi as usize) {
@@ -1364,8 +1409,18 @@ fn raster_band(
             if d >= depth[idx] {
                 continue;
             }
+
+            // 遠近補正した属性を戻す。
+            let p = (t.p[0] * l0 + t.p[1] * l1 + t.p[2] * l2) * d;
+            let n = (t.n[0] * l0 + t.n[1] * l1 + t.n[2] * l2) * d;
+            let alb = (t.c[0] * l0 + t.c[1] * l1 + t.c[2] * l2) * d;
+
+            // 影の箱は地面用。物体自身に当てると自分の影で真っ黒になる。
+            let lit = shade_of(env, cam, p, n.norm(), alb, &t.mat, 0.0);
+            let dv = p - cam;
+            let dist = dv.len();
             depth[idx] = d;
-            buf[idx] = (ca * l0 + cb * l1 + cc * l2) * d;
+            buf[idx] = fog_of(env, lit, dist, dv / dist.max(1e-6));
         }
     }
 }
