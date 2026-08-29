@@ -16,7 +16,7 @@ use crossterm::{cursor, execute, terminal};
 
 use math::*;
 use mesh::Builder;
-use render::Renderer;
+use render::{Blocks, Renderer};
 use sky::Sky;
 use smoke::Smoke;
 use train::Train;
@@ -75,6 +75,7 @@ struct Args {
     seed: u64,
     fly: bool,
     hud: bool,
+    blocks: Blocks,
     bench: usize,
     screenshot: Option<String>,
     record: Option<String>,
@@ -82,6 +83,7 @@ struct Args {
     shot_at: f32,
     shot_w: usize,
     shot_h: usize,
+    term: Option<(usize, usize)>,
 }
 
 impl Default for Args {
@@ -98,6 +100,7 @@ impl Default for Args {
             seed: 20260829,
             fly: false,
             hud: false,
+            blocks: Blocks::Quad,
             bench: 0,
             screenshot: None,
             record: None,
@@ -105,6 +108,7 @@ impl Default for Args {
             shot_at: 4.2,
             shot_w: 0,
             shot_h: 0,
+            term: None,
         }
     }
 }
@@ -125,9 +129,12 @@ sl-real — 端末を走る 3D 蒸気機関車
   --seed <n>        風景の乱数種
   --fly             機関車が飛ぶ
   --hud             速度などの情報を重ねる
-  --screenshot <f>  1 枚だけ PPM に書き出して終わる (--at 秒 / --size WxH)
+  --blocks <mode>   quad = 1 セル 2x2 ピクセル（既定・横解像度が倍）
+                    half = 1 セル 1x2 ピクセル（字形の対応が広い）
+  --screenshot <f>  1 枚だけ PPM に書き出して終わる (--at 秒 / --size ピクセル)
   --record <前置き> 連番 PPM を書き出す (--frames 枚数 / --fps)
-  --bench <n>       描画だけを n 回まわして速度を測る
+  --term <桁x行>    書き出しを端末と同じ格子・同じ画角で行う
+  --bench <n>       描画だけを n 回まわして速度を測る (--size は 桁x行)
   -h, --help        このヘルプ
 
   操作: q 終了 / space 一時停止 / c カメラ切替 / +- 速度
@@ -158,12 +165,28 @@ fn parse_args() -> Result<Args, String> {
             "--seed" => a.seed = val()?.parse().map_err(|_| "--seed が数値ではありません")?,
             "--fly" | "-F" => a.fly = true,
             "--hud" => a.hud = true,
+            "--blocks" => {
+                let v = val()?;
+                a.blocks = match v.as_str() {
+                    "quad" => Blocks::Quad,
+                    "half" => Blocks::Half,
+                    _ => return Err(format!("--blocks は quad か half です: {v}")),
+                };
+            }
             "-l" => a.cars = 0,
             "--screenshot" => a.screenshot = Some(val()?),
             "--record" => a.record = Some(val()?),
             "--frames" => a.frames = val()?.parse().map_err(|_| "--frames が数値ではありません")?,
             "--bench" => a.bench = val()?.parse().map_err(|_| "--bench が数値ではありません")?,
             "--at" => a.shot_at = val()?.parse().map_err(|_| "--at が数値ではありません")?,
+            "--term" => {
+                let s = val()?;
+                let (c, r) = s.split_once('x').ok_or("--term は 桁x行 の形式です")?;
+                a.term = Some((
+                    c.parse().map_err(|_| "--term の桁数が不正です")?,
+                    r.parse().map_err(|_| "--term の行数が不正です")?,
+                ));
+            }
             "--size" => {
                 let s = val()?;
                 let (w, h) = s.split_once('x').ok_or("--size は WxH の形式です")?;
@@ -203,6 +226,17 @@ fn local_hour() -> f32 {
         .and_then(|s| s.parse::<f32>().ok())
         .unwrap_or(9.0);
     ((secs % 86400) as f32 / 3600.0 + off).rem_euclid(24.0)
+}
+
+/// 書き出し用のレンダラ。`--term` があれば端末とまったく同じ格子で作る。
+fn offline_renderer(args: &Args, default_px: (usize, usize)) -> Renderer {
+    if let Some((c, r)) = args.term {
+        return Renderer::for_terminal(c.max(4), r.max(2), args.blocks);
+    }
+    let (w, h) = if args.shot_w > 0 { (args.shot_w, args.shot_h) } else { default_px };
+    let mut r = Renderer::new(w, h);
+    r.set_px_aspect(1.0);
+    r
 }
 
 /// 列車が現れる位置と、走り去ったと見なす位置。
@@ -403,12 +437,7 @@ fn run(args: Args) -> std::io::Result<()> {
 
     // ---- 静止画モード（開発とドキュメント用）。
     if let Some(path) = &args.screenshot {
-        let (sw, sh) = if args.shot_w > 0 {
-            (args.shot_w, args.shot_h)
-        } else {
-            (240, 140)
-        };
-        let mut r = Renderer::new(sw, sh);
+        let mut r = offline_renderer(&args, (480, 270));
         // 目的の時刻まで小刻みに進めて、煙を育てておく。
         let dt = 1.0 / 60.0;
         let steps = (args.shot_at / dt) as usize;
@@ -423,8 +452,7 @@ fn run(args: Args) -> std::io::Result<()> {
 
     // ---- 連番書き出し。デモ動画を作るときに使う。
     if let Some(prefix) = &args.record {
-        let (sw, sh) = if args.shot_w > 0 { (args.shot_w, args.shot_h) } else { (480, 270) };
-        let mut r = Renderer::new(sw, sh);
+        let mut r = offline_renderer(&args, (480, 270));
         let dt = 1.0 / args.fps as f32;
         for i in 0..args.frames {
             w.t.headlight = smoothstep(0.30, 0.02, w.sky.day);
@@ -439,8 +467,9 @@ fn run(args: Args) -> std::io::Result<()> {
 
     // ---- ベンチマーク。端末に触らず描画だけを回す。
     if args.bench > 0 {
-        let (sw, sh) = if args.shot_w > 0 { (args.shot_w, args.shot_h) } else { (200, 100) };
-        let mut r = Renderer::new(sw, sh);
+        // ベンチは端末の桁数・行数で指定する（--size 200x50 = 200 桁 50 行）。
+        let (cols, rows) = if args.shot_w > 0 { (args.shot_w, args.shot_h) } else { (200, 50) };
+        let mut r = Renderer::for_terminal(cols, rows, args.blocks);
         let mut buf = String::with_capacity(1 << 20);
         let dt = 1.0 / 60.0;
         let start = Instant::now();
@@ -452,9 +481,11 @@ fn run(args: Args) -> std::io::Result<()> {
         }
         let el = start.elapsed().as_secs_f64();
         println!(
-            "{}x{} px  {} frames  {:.2} ms/frame  ({:.1} fps)  出力 {} bytes/frame",
-            sw,
-            sh,
+            "{}x{} 桁行 ({}x{} px)  {} frames  {:.2} ms/frame  ({:.1} fps)  出力 {} bytes/frame",
+            cols,
+            rows,
+            r.w,
+            r.h,
             args.bench,
             el * 1000.0 / args.bench as f64,
             args.bench as f64 / el,
@@ -472,10 +503,10 @@ fn run(args: Args) -> std::io::Result<()> {
     execute!(out, terminal::EnterAlternateScreen, cursor::Hide)?;
 
     // 端末サイズが取れない環境（パイプ越しなど）でも動くように下限を設ける。
-    let clamp_size = |c: u16, r: u16| (c.max(20) as usize, (r.max(6) as usize) * 2);
+    let clamp_size = |c: u16, r: u16| (c.max(20) as usize, r.max(6) as usize);
     let (mut cols, mut rows) = terminal::size().unwrap_or((100, 30));
-    let (mut pw, mut ph) = clamp_size(cols, rows);
-    let mut r = Renderer::new(pw, ph);
+    let (mut tc, mut tr) = clamp_size(cols, rows);
+    let mut r = Renderer::for_terminal(tc, tr, args.blocks);
     let mut buf = String::with_capacity(1 << 20);
 
     let mut cam = args.cam;
@@ -519,11 +550,11 @@ fn run(args: Args) -> std::io::Result<()> {
                 Event::Resize(c, rw) => {
                     cols = c;
                     rows = rw;
-                    let (nw, nh) = clamp_size(cols, rows);
-                    if (nw, nh) != (pw, ph) {
-                        pw = nw;
-                        ph = nh;
-                        r.resize(pw, ph);
+                    let (nc, nr) = clamp_size(cols, rows);
+                    if (nc, nr) != (tc, tr) {
+                        tc = nc;
+                        tr = nr;
+                        r.resize_terminal(tc, tr);
                     }
                 }
                 _ => {}
@@ -563,13 +594,13 @@ fn run(args: Args) -> std::io::Result<()> {
                 cam.label(),
                 w.smoke.parts.len(),
                 fps_avg,
-                pw,
-                ph / 2,
+                tc,
+                tr,
             );
             let _ = write!(
                 out,
                 "\x1b[{};1H\x1b[0m\x1b[38;2;235;235;235m\x1b[48;2;20;20;24m{}\x1b[0m",
-                (ph / 2).max(1), s
+                tr, s
             );
         }
         out.flush()?;

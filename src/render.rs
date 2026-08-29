@@ -4,6 +4,25 @@
 use crate::math::*;
 use std::fmt::Write as _;
 
+/// 1 セルをどう埋めるか。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Blocks {
+    /// `▀` だけを使う。1 セル = 縦 2 ピクセル。字形の対応は最も広い。
+    Half,
+    /// 四分割ブロックを使う。1 セル = 2x2 ピクセルで横解像度が倍になる。
+    /// 1 セルに 2 色までなので、4 つの小画素を 2 色へ最適に分ける。
+    Quad,
+}
+
+/// 端末に出す 1 セル。
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+struct Cell {
+    fg: [u8; 3],
+    bg: [u8; 3],
+    /// 前景として塗る小画素のビットマスク（下位から TL, TR, BL, BR）。
+    mask: u8,
+}
+
 /// 面の質感。
 #[derive(Clone, Copy, Debug)]
 pub struct Material {
@@ -78,6 +97,9 @@ pub struct Env {
 pub struct Renderer {
     pub w: usize,
     pub h: usize,
+    /// 1 ピクセルの横幅 / 高さ。Quad では横に細長い (0.5)。
+    pub px_aspect: f32,
+    blocks: Blocks,
     pub color: Vec<V3>,
     pub depth: Vec<f32>,
     pub view_proj: M4,
@@ -94,7 +116,7 @@ pub struct Renderer {
     bloom_b: Vec<V3>,
     bw: usize,
     bh: usize,
-    prev_cells: Vec<[u8; 6]>,
+    prev_cells: Vec<Cell>,
     prev_valid: bool,
 }
 
@@ -119,10 +141,29 @@ struct ClipV {
 }
 
 impl Renderer {
+    /// 端末の桁数・行数と描画モードからフレームバッファを作る。
+    pub fn for_terminal(cols: usize, rows: usize, blocks: Blocks) -> Renderer {
+        let (w, h) = Self::dims(cols, rows, blocks);
+        let mut r = Renderer::new(w, h);
+        r.blocks = blocks;
+        r.px_aspect = if blocks == Blocks::Quad { 0.5 } else { 1.0 };
+        r.prev_cells = vec![Cell::default(); cols * rows];
+        r
+    }
+
+    fn dims(cols: usize, rows: usize, blocks: Blocks) -> (usize, usize) {
+        match blocks {
+            Blocks::Half => (cols, rows * 2),
+            Blocks::Quad => (cols * 2, rows * 2),
+        }
+    }
+
     pub fn new(w: usize, h: usize) -> Renderer {
         Renderer {
             w,
             h,
+            px_aspect: 1.0,
+            blocks: Blocks::Half,
             color: vec![V3::ZERO; w * h],
             depth: vec![f32::INFINITY; w * h],
             view_proj: M4::identity(),
@@ -151,9 +192,21 @@ impl Renderer {
             bloom_b: vec![V3::ZERO; (w / 2).max(1) * (h / 2).max(1)],
             bw: (w / 2).max(1),
             bh: (h / 2).max(1),
-            prev_cells: vec![[0; 6]; w * (h / 2)],
+            prev_cells: vec![Cell::default(); w * (h / 2)],
             prev_valid: false,
         }
+    }
+
+    /// PPM 書き出しなどでピクセルを正方形として扱いたいときに使う。
+    pub fn set_px_aspect(&mut self, a: f32) {
+        self.px_aspect = a;
+    }
+
+    /// 端末サイズの変化に追随する。
+    pub fn resize_terminal(&mut self, cols: usize, rows: usize) {
+        let (w, h) = Self::dims(cols, rows, self.blocks);
+        self.resize(w, h);
+        self.prev_cells = vec![Cell::default(); cols * rows];
     }
 
     pub fn resize(&mut self, w: usize, h: usize) {
@@ -161,7 +214,7 @@ impl Renderer {
         self.h = h;
         self.color = vec![V3::ZERO; w * h];
         self.depth = vec![f32::INFINITY; w * h];
-        self.prev_cells = vec![[0; 6]; w * (h / 2)];
+        self.prev_cells = vec![Cell::default(); w * (h / 2)];
         self.prev_valid = false;
         self.bw = (w / 2).max(1);
         self.bh = (h / 2).max(1);
@@ -205,8 +258,9 @@ impl Renderer {
         self.shadow_boxes.clear();
     }
 
+    /// 画面の物理的な縦横比。ピクセルが正方形でない場合も込み。
     pub fn aspect(&self) -> f32 {
-        self.w as f32 / self.h as f32
+        self.w as f32 * self.px_aspect / self.h as f32
     }
 
     // ---------------------------------------------------------------- 陰影
@@ -432,6 +486,8 @@ impl Renderer {
         if r < 0.35 || r > 4000.0 {
             return;
         }
+        // ピクセルが正方形でないモードでは、縦の半径を詰める。
+        let ry = r * self.px_aspect;
 
         let depth = cp[3];
         let d = center - self.cam_pos;
@@ -450,17 +506,18 @@ impl Renderer {
 
         let x0 = (sx - r).floor().max(0.0) as usize;
         let x1 = ((sx + r).ceil() as i32).min(self.w as i32 - 1);
-        let y0 = (sy - r).floor().max(0.0) as usize;
-        let y1 = ((sy + r).ceil() as i32).min(self.h as i32 - 1);
+        let y0 = (sy - ry).floor().max(0.0) as usize;
+        let y1 = ((sy + ry).ceil() as i32).min(self.h as i32 - 1);
         if x1 < 0 || y1 < 0 || x0 >= self.w || y0 >= self.h {
             return;
         }
         let inv_r = 1.0 / r;
+        let inv_ry = 1.0 / ry.max(1e-4);
         // スプライト内部のノイズの粗さは、画面上の大きさに合わせる。
         let nscale = 2.6;
 
         for py in y0..=(y1 as usize) {
-            let dy = (py as f32 + 0.5 - sy) * inv_r;
+            let dy = (py as f32 + 0.5 - sy) * inv_ry;
             let row = py * self.w;
             for px in x0..=(x1 as usize) {
                 let dx = (px as f32 + 0.5 - sx) * inv_r;
@@ -510,17 +567,19 @@ impl Renderer {
         if r > 3000.0 {
             return;
         }
+        let ry = (r * self.px_aspect).max(0.5);
 
         let x0 = (sx - r).floor().max(0.0) as usize;
         let x1 = ((sx + r).ceil() as i32).min(self.w as i32 - 1);
-        let y0 = (sy - r).floor().max(0.0) as usize;
-        let y1 = ((sy + r).ceil() as i32).min(self.h as i32 - 1);
+        let y0 = (sy - ry).floor().max(0.0) as usize;
+        let y1 = ((sy + ry).ceil() as i32).min(self.h as i32 - 1);
         if x1 < 0 || y1 < 0 || x0 >= self.w || y0 >= self.h {
             return;
         }
         let inv_r = 1.0 / r;
+        let inv_ry = 1.0 / ry;
         for py in y0..=(y1 as usize) {
-            let dy = (py as f32 + 0.5 - sy) * inv_r;
+            let dy = (py as f32 + 0.5 - sy) * inv_ry;
             let row = py * self.w;
             for px in x0..=(x1 as usize) {
                 let dx = (px as f32 + 0.5 - sx) * inv_r;
@@ -562,8 +621,10 @@ impl Renderer {
             }
         }
         // 半径を変えた箱ぼかしを重ねて、広がりのあるにじみにする。
+        // ピクセルが横に細いモードでは、横方向の半径を増やして等方に見せる。
+        let hx = (1.0 / self.px_aspect).round().max(1.0) as usize;
         for &r in &[2usize, 5, 11] {
-            blur_h(&self.bloom_a, &mut self.bloom_b, bw, bh, r);
+            blur_h(&self.bloom_a, &mut self.bloom_b, bw, bh, r * hx);
             blur_v(&self.bloom_b, &mut self.bloom_a, bw, bh, r);
         }
         // 薄明視。暗部の彩度を落として青へ寄せる。
@@ -614,10 +675,88 @@ impl Renderer {
         [e(r), e(g), e(b)]
     }
 
+    /// 2x2 の小画素を 2 色へ最適に分ける。返すのは (前景色, 背景色, マスク)。
+    ///
+    /// 1 セルに置ける色は 2 つだけなので、4 つの分け方を総当たりして
+    /// 二乗誤差が最小になる組を選ぶ。TL を必ず背景側に固定すると
+    /// 反転した重複が消えて 8 通りで済む。
+    #[inline]
+    fn quantize(px: [[u8; 3]; 4]) -> ([u8; 3], [u8; 3], u8) {
+        let f = |c: [u8; 3]| [c[0] as i32, c[1] as i32, c[2] as i32];
+        let p: [[i32; 3]; 4] = [f(px[0]), f(px[1]), f(px[2]), f(px[3])];
+
+        let mut best = (i32::MAX, 0u8, [0i32; 3], [0i32; 3]);
+        for m in [0u8, 2, 4, 6, 8, 10, 12, 14] {
+            let mut sa = [0i32; 3];
+            let mut sb = [0i32; 3];
+            let mut na = 0i32;
+            let mut nb = 0i32;
+            for (i, q) in p.iter().enumerate() {
+                if m >> i & 1 == 1 {
+                    for k in 0..3 {
+                        sa[k] += q[k];
+                    }
+                    na += 1;
+                } else {
+                    for k in 0..3 {
+                        sb[k] += q[k];
+                    }
+                    nb += 1;
+                }
+            }
+            let ma = if na > 0 { [sa[0] / na, sa[1] / na, sa[2] / na] } else { [0; 3] };
+            let mb = if nb > 0 { [sb[0] / nb, sb[1] / nb, sb[2] / nb] } else { [0; 3] };
+            let mut err = 0i32;
+            for (i, q) in p.iter().enumerate() {
+                let c = if m >> i & 1 == 1 { ma } else { mb };
+                for k in 0..3 {
+                    let d = q[k] - c[k];
+                    err += d * d;
+                }
+            }
+            if err < best.0 {
+                best = (err, m, ma, mb);
+            }
+            if err == 0 {
+                break;
+            }
+        }
+        let (_, mask, ma, mb) = best;
+        let to_u8 = |c: [i32; 3]| [c[0] as u8, c[1] as u8, c[2] as u8];
+        (to_u8(ma), to_u8(mb), mask)
+    }
+
+    /// マスクに対応する四分割ブロック文字。ビットは TL, TR, BL, BR。
+    #[inline]
+    fn glyph(mask: u8) -> char {
+        match mask {
+            0b0000 => ' ',
+            0b0001 => '\u{2598}', // ▘
+            0b0010 => '\u{259D}', // ▝
+            0b0011 => '\u{2580}', // ▀
+            0b0100 => '\u{2596}', // ▖
+            0b0101 => '\u{258C}', // ▌
+            0b0110 => '\u{259E}', // ▞
+            0b0111 => '\u{259B}', // ▛
+            0b1000 => '\u{2597}', // ▗
+            0b1001 => '\u{259A}', // ▚
+            0b1010 => '\u{2590}', // ▐
+            0b1011 => '\u{259C}', // ▜
+            0b1100 => '\u{2584}', // ▄
+            0b1101 => '\u{2599}', // ▙
+            0b1110 => '\u{259F}', // ▟
+            _ => '\u{2588}',      // █
+        }
+    }
+
     /// 差分のみを ANSI で書き出す。`full` なら全セルを再描画する。
     pub fn present(&mut self, out: &mut String, full: bool) {
         out.clear();
         let rows = self.h / 2;
+        let cols = match self.blocks {
+            Blocks::Half => self.w,
+            Blocks::Quad => self.w / 2,
+        };
         let full = full || !self.prev_valid;
         let mut cursor: Option<(usize, usize)> = None;
         let mut last_fg: Option<[u8; 3]> = None;
@@ -626,11 +765,31 @@ impl Renderer {
         for row in 0..rows {
             let top = row * 2 * self.w;
             let bot = (row * 2 + 1) * self.w;
-            for col in 0..self.w {
-                let t = self.tonemap(self.color[top + col]);
-                let b = self.tonemap(self.color[bot + col]);
-                let cell = [t[0], t[1], t[2], b[0], b[1], b[2]];
-                let pi = row * self.w + col;
+            for col in 0..cols {
+                let cell = match self.blocks {
+                    Blocks::Half => {
+                        let t = self.tonemap(self.color[top + col]);
+                        let b = self.tonemap(self.color[bot + col]);
+                        if t == b {
+                            Cell { fg: t, bg: b, mask: 0 }
+                        } else {
+                            Cell { fg: t, bg: b, mask: 0b0011 }
+                        }
+                    }
+                    Blocks::Quad => {
+                        let x = col * 2;
+                        let px = [
+                            self.tonemap(self.color[top + x]),
+                            self.tonemap(self.color[top + x + 1]),
+                            self.tonemap(self.color[bot + x]),
+                            self.tonemap(self.color[bot + x + 1]),
+                        ];
+                        let (fg, bg, mask) = Self::quantize(px);
+                        Cell { fg, bg, mask }
+                    }
+                };
+
+                let pi = row * cols + col;
                 if !full && self.prev_cells[pi] == cell {
                     continue;
                 }
@@ -642,11 +801,15 @@ impl Renderer {
                     last_bg = None;
                 }
 
-                // 上下が同じ色なら空白 1 文字で済む。背景色だけ送ればよい。
-                if t == b {
-                    if last_bg != Some(b) {
-                        let _ = write!(out, "\x1b[48;2;{};{};{}m", b[0], b[1], b[2]);
-                        last_bg = Some(b);
+                // 全部が背景色なら空白 1 文字で済む。
+                if cell.mask == 0 {
+                    if last_bg != Some(cell.bg) {
+                        let _ = write!(
+                            out,
+                            "\x1b[48;2;{};{};{}m",
+                            cell.bg[0], cell.bg[1], cell.bg[2]
+                        );
+                        last_bg = Some(cell.bg);
                     }
                     out.push(' ');
                     cursor = Some((row, col + 1));
@@ -654,19 +817,20 @@ impl Renderer {
                 }
 
                 // 前景と背景が両方変わるときは 1 つの SGR にまとめる。
-                match (last_fg != Some(t), last_bg != Some(b)) {
+                let (f, b) = (cell.fg, cell.bg);
+                match (last_fg != Some(f), last_bg != Some(b)) {
                     (true, true) => {
                         let _ = write!(
                             out,
                             "\x1b[38;2;{};{};{};48;2;{};{};{}m",
-                            t[0], t[1], t[2], b[0], b[1], b[2]
+                            f[0], f[1], f[2], b[0], b[1], b[2]
                         );
-                        last_fg = Some(t);
+                        last_fg = Some(f);
                         last_bg = Some(b);
                     }
                     (true, false) => {
-                        let _ = write!(out, "\x1b[38;2;{};{};{}m", t[0], t[1], t[2]);
-                        last_fg = Some(t);
+                        let _ = write!(out, "\x1b[38;2;{};{};{}m", f[0], f[1], f[2]);
+                        last_fg = Some(f);
                     }
                     (false, true) => {
                         let _ = write!(out, "\x1b[48;2;{};{};{}m", b[0], b[1], b[2]);
@@ -674,7 +838,7 @@ impl Renderer {
                     }
                     (false, false) => {}
                 }
-                out.push('\u{2580}'); // ▀
+                out.push(Self::glyph(cell.mask));
                 cursor = Some((row, col + 1));
             }
         }
@@ -682,10 +846,16 @@ impl Renderer {
     }
 
     /// PPM (P6) として書き出す。開発時の目視確認用。
+    /// ピクセルが正方形でないモードでは、縦に伸ばして比率を合わせる。
     pub fn to_ppm(&self) -> Vec<u8> {
-        let mut out = format!("P6\n{} {}\n255\n", self.w, self.h).into_bytes();
-        for c in &self.color {
-            out.extend_from_slice(&self.tonemap(*c));
+        let rep = (1.0 / self.px_aspect).round().max(1.0) as usize;
+        let mut out =
+            format!("P6\n{} {}\n255\n", self.w, self.h * rep).into_bytes();
+        for row in self.color.chunks(self.w) {
+            let line: Vec<u8> = row.iter().flat_map(|c| self.tonemap(*c)).collect();
+            for _ in 0..rep {
+                out.extend_from_slice(&line);
+            }
         }
         out
     }
