@@ -487,11 +487,16 @@ fn run(args: Args) -> std::io::Result<()> {
     let frame = Duration::from_secs_f32(1.0 / args.fps as f32);
     let mut last = Instant::now();
     let mut quit = false;
+    // HUD 用の実測フレームレート。急な変動をならして表示する。
+    let mut fps_avg = args.fps as f32;
 
     while !quit {
         let now = Instant::now();
         let dt = (now - last).as_secs_f32().min(0.1);
         last = now;
+        if dt > 1e-4 {
+            fps_avg += (1.0 / dt - fps_avg) * 0.1;
+        }
 
         // ---- 入力。
         while interactive && event::poll(Duration::from_millis(0))? {
@@ -551,12 +556,15 @@ fn run(args: Args) -> std::io::Result<()> {
         if hud {
             let kmh = w.t.speed * 3.6;
             let s = format!(
-                " {:>5.1} km/h │ {:02}:{:02} │ {} │ 煙 {:<4} │ q:終了 c:カメラ f:飛ぶ ",
+                " {:>5.1} km/h │ {:02}:{:02} │ {} │ 煙 {:<4} │ {:>4.1} fps │ {}x{} │ q:終了 c:カメラ f:飛ぶ ",
                 kmh,
                 w.hour.floor() as i32,
                 ((w.hour.fract() * 60.0) as i32).clamp(0, 59),
                 cam.label(),
                 w.smoke.parts.len(),
+                fps_avg,
+                pw,
+                ph / 2,
             );
             let _ = write!(
                 out,

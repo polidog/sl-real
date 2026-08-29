@@ -641,13 +641,38 @@ impl Renderer {
                     last_fg = None;
                     last_bg = None;
                 }
-                if last_fg != Some(t) {
-                    let _ = write!(out, "\x1b[38;2;{};{};{}m", t[0], t[1], t[2]);
-                    last_fg = Some(t);
+
+                // 上下が同じ色なら空白 1 文字で済む。背景色だけ送ればよい。
+                if t == b {
+                    if last_bg != Some(b) {
+                        let _ = write!(out, "\x1b[48;2;{};{};{}m", b[0], b[1], b[2]);
+                        last_bg = Some(b);
+                    }
+                    out.push(' ');
+                    cursor = Some((row, col + 1));
+                    continue;
                 }
-                if last_bg != Some(b) {
-                    let _ = write!(out, "\x1b[48;2;{};{};{}m", b[0], b[1], b[2]);
-                    last_bg = Some(b);
+
+                // 前景と背景が両方変わるときは 1 つの SGR にまとめる。
+                match (last_fg != Some(t), last_bg != Some(b)) {
+                    (true, true) => {
+                        let _ = write!(
+                            out,
+                            "\x1b[38;2;{};{};{};48;2;{};{};{}m",
+                            t[0], t[1], t[2], b[0], b[1], b[2]
+                        );
+                        last_fg = Some(t);
+                        last_bg = Some(b);
+                    }
+                    (true, false) => {
+                        let _ = write!(out, "\x1b[38;2;{};{};{}m", t[0], t[1], t[2]);
+                        last_fg = Some(t);
+                    }
+                    (false, true) => {
+                        let _ = write!(out, "\x1b[48;2;{};{};{}m", b[0], b[1], b[2]);
+                        last_bg = Some(b);
+                    }
+                    (false, false) => {}
                 }
                 out.push('\u{2580}'); // ▀
                 cursor = Some((row, col + 1));
