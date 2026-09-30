@@ -34,11 +34,7 @@ impl V3 {
     }
     pub fn norm(self) -> V3 {
         let l = self.len();
-        if l > 1e-9 {
-            self / l
-        } else {
-            V3::ZERO
-        }
+        if l > 1e-9 { self / l } else { V3::ZERO }
     }
     pub fn lerp(self, o: V3, t: f32) -> V3 {
         self + (o - self) * t
@@ -91,11 +87,9 @@ pub struct M4(pub [[f32; 4]; 4]);
 
 impl M4 {
     pub fn identity() -> M4 {
-        let mut m = [[0.0; 4]; 4];
-        for i in 0..4 {
-            m[i][i] = 1.0;
-        }
-        M4(m)
+        M4(std::array::from_fn(|i| {
+            std::array::from_fn(|j| if i == j { 1.0 } else { 0.0 })
+        }))
     }
 
     pub fn translate(t: V3) -> M4 {
@@ -145,17 +139,9 @@ impl M4 {
     }
 
     pub fn mul(&self, o: &M4) -> M4 {
-        let mut r = [[0.0f32; 4]; 4];
-        for i in 0..4 {
-            for j in 0..4 {
-                let mut s = 0.0;
-                for k in 0..4 {
-                    s += self.0[i][k] * o.0[k][j];
-                }
-                r[i][j] = s;
-            }
-        }
-        M4(r)
+        M4(std::array::from_fn(|i| {
+            std::array::from_fn(|j| (0..4).map(|k| self.0[i][k] * o.0[k][j]).sum())
+        }))
     }
 
     /// 位置ベクトル（w=1）を変換する。

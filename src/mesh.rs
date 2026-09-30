@@ -2,8 +2,7 @@
 //! 変換行列スタックを持ち、プリミティブをそのままラスタライザへ流す。
 
 use crate::math::*;
-use crate::noise::fbm3;
-use crate::render::{Material, Renderer, Vtx};
+use crate::render::{Grime, Material, Renderer, Vtx};
 
 pub struct Builder<'a> {
     pub r: &'a mut Renderer,
@@ -60,43 +59,45 @@ impl<'a> Builder<'a> {
         self.xf.xf_dir(n).norm()
     }
 
+    /// いまの素材色と汚れ。上向きの面ほど煤が溜まる想定は
+    /// 呼び出し側で grime の値を変えて表現する。
     #[inline]
-    fn albedo(&self, wp: V3) -> V3 {
+    fn surface(&self) -> (V3, Grime) {
         if self.grime <= 0.0 {
-            return self.color;
+            return (self.color, Grime::default());
         }
         // 遠い物体は汚れの模様が見えないので、平均的に暗くするだけにする。
         if self.detail < 0.65 {
-            return self.color * (1.0 - self.grime * 0.30);
+            return (self.color * (1.0 - self.grime * 0.30), Grime::default());
         }
-        // 世界座標のノイズで汚れを乗せる。上向きの面ほど煤が溜まる想定は
-        // 呼び出し側で grime の値を変えて表現する。
-        let n = fbm3(wp * self.grime_scale, 2);
-        let k = saturate(n * 1.35 - 0.15) * self.grime;
-        self.color.lerp(self.grime_tint, k * 0.85)
-            * (1.0 - k * 0.25)
+        let g = Grime {
+            amount: self.grime,
+            scale: self.grime_scale,
+            tint: self.grime_tint,
+        };
+        (self.color, g)
     }
 
     /// スムーズ法線付きの三角形（ローカル座標）。
     pub fn tri_n(&mut self, p: [V3; 3], n: [V3; 3]) {
-        let wp: Vec<V3> = p.iter().map(|q| self.wp(*q)).collect();
-        let wn: Vec<V3> = n.iter().map(|q| self.wn(*q)).collect();
-        let m = self.mat;
-        let vs: Vec<Vtx> = (0..3)
-            .map(|i| Vtx { p: wp[i], n: wn[i], c: self.albedo(wp[i]) })
-            .collect();
-        self.r.tri(&vs[0], &vs[1], &vs[2], &m);
+        let (m, (c, g)) = (self.mat, self.surface());
+        let vs: [Vtx; 3] = std::array::from_fn(|i| Vtx {
+            p: self.wp(p[i]),
+            n: self.wn(n[i]),
+            c,
+        });
+        self.r.tri(&vs[0], &vs[1], &vs[2], &m, g);
     }
 
     /// フラット法線の三角形。
     pub fn tri_flat(&mut self, a: V3, b: V3, c: V3) {
         let (wa, wb, wc) = (self.wp(a), self.wp(b), self.wp(c));
         let n = (wb - wa).cross(wc - wa).norm();
-        let m = self.mat;
-        let va = Vtx { p: wa, n, c: self.albedo(wa) };
-        let vb = Vtx { p: wb, n, c: self.albedo(wb) };
-        let vc = Vtx { p: wc, n, c: self.albedo(wc) };
-        self.r.tri(&va, &vb, &vc, &m);
+        let (m, (c, g)) = (self.mat, self.surface());
+        let va = Vtx { p: wa, n, c };
+        let vb = Vtx { p: wb, n, c };
+        let vc = Vtx { p: wc, n, c };
+        self.r.tri(&va, &vb, &vc, &m, g);
     }
 
     /// フラット法線の四角形。頂点は順に並んでいること。
@@ -115,14 +116,44 @@ impl<'a> Builder<'a> {
     pub fn bx(&mut self, lo: V3, hi: V3) {
         let (a, b) = (lo, hi);
         // -Z / +Z
-        self.quad(v3(a.x, a.y, a.z), v3(a.x, b.y, a.z), v3(b.x, b.y, a.z), v3(b.x, a.y, a.z));
-        self.quad(v3(a.x, a.y, b.z), v3(b.x, a.y, b.z), v3(b.x, b.y, b.z), v3(a.x, b.y, b.z));
+        self.quad(
+            v3(a.x, a.y, a.z),
+            v3(a.x, b.y, a.z),
+            v3(b.x, b.y, a.z),
+            v3(b.x, a.y, a.z),
+        );
+        self.quad(
+            v3(a.x, a.y, b.z),
+            v3(b.x, a.y, b.z),
+            v3(b.x, b.y, b.z),
+            v3(a.x, b.y, b.z),
+        );
         // -X / +X
-        self.quad(v3(a.x, a.y, a.z), v3(a.x, a.y, b.z), v3(a.x, b.y, b.z), v3(a.x, b.y, a.z));
-        self.quad(v3(b.x, a.y, a.z), v3(b.x, b.y, a.z), v3(b.x, b.y, b.z), v3(b.x, a.y, b.z));
+        self.quad(
+            v3(a.x, a.y, a.z),
+            v3(a.x, a.y, b.z),
+            v3(a.x, b.y, b.z),
+            v3(a.x, b.y, a.z),
+        );
+        self.quad(
+            v3(b.x, a.y, a.z),
+            v3(b.x, b.y, a.z),
+            v3(b.x, b.y, b.z),
+            v3(b.x, a.y, b.z),
+        );
         // -Y / +Y
-        self.quad(v3(a.x, a.y, a.z), v3(b.x, a.y, a.z), v3(b.x, a.y, b.z), v3(a.x, a.y, b.z));
-        self.quad(v3(a.x, b.y, a.z), v3(a.x, b.y, b.z), v3(b.x, b.y, b.z), v3(b.x, b.y, a.z));
+        self.quad(
+            v3(a.x, a.y, a.z),
+            v3(b.x, a.y, a.z),
+            v3(b.x, a.y, b.z),
+            v3(a.x, a.y, b.z),
+        );
+        self.quad(
+            v3(a.x, b.y, a.z),
+            v3(a.x, b.y, b.z),
+            v3(b.x, b.y, b.z),
+            v3(b.x, b.y, a.z),
+        );
     }
 
     /// Y 軸に沿った円錐台（r0 が y=0、r1 が y=h）。角度は `a0..a1`。
@@ -159,16 +190,10 @@ impl<'a> Builder<'a> {
                 }
                 if caps {
                     if r0 > 1e-6 {
-                        self.tri_n(
-                            [V3::ZERO, p0, q0],
-                            [v3(0.0, -1.0, 0.0); 3],
-                        );
+                        self.tri_n([V3::ZERO, p0, q0], [v3(0.0, -1.0, 0.0); 3]);
                     }
                     if r1 > 1e-6 {
-                        self.tri_n(
-                            [v3(0.0, h, 0.0), q1, p1],
-                            [v3(0.0, 1.0, 0.0); 3],
-                        );
+                        self.tri_n([v3(0.0, h, 0.0), q1, p1], [v3(0.0, 1.0, 0.0); 3]);
                     }
                 }
             }
@@ -253,7 +278,11 @@ impl<'a> Builder<'a> {
     /// XZ 平面の円盤（法線は +Y）。
     pub fn disc_y(&mut self, r: f32, seg: usize, up: bool) {
         let seg = self.sg(seg).max(3);
-        let n = if up { v3(0.0, 1.0, 0.0) } else { v3(0.0, -1.0, 0.0) };
+        let n = if up {
+            v3(0.0, 1.0, 0.0)
+        } else {
+            v3(0.0, -1.0, 0.0)
+        };
         for i in 0..seg {
             let a0 = i as f32 / seg as f32 * std::f32::consts::TAU;
             let a1 = (i + 1) as f32 / seg as f32 * std::f32::consts::TAU;

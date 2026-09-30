@@ -161,7 +161,11 @@ fn parse_args() -> Result<Args, String> {
             "--speed" => a.speed = val()?.parse().map_err(|_| "--speed が数値ではありません")?,
             "--cars" => a.cars = val()?.parse().map_err(|_| "--cars が数値ではありません")?,
             "--time" => a.hour = val()?.parse().map_err(|_| "--time が数値ではありません")?,
-            "--clouds" => a.clouds = val()?.parse().map_err(|_| "--clouds が数値ではありません")?,
+            "--clouds" => {
+                a.clouds = val()?
+                    .parse()
+                    .map_err(|_| "--clouds が数値ではありません")?
+            }
             "--camera" => {
                 let s = val()?;
                 a.cam = Cam::parse(&s).ok_or_else(|| format!("不明なカメラ: {s}"))?;
@@ -192,7 +196,11 @@ fn parse_args() -> Result<Args, String> {
             "-l" => a.cars = 0,
             "--screenshot" => a.screenshot = Some(val()?),
             "--record" => a.record = Some(val()?),
-            "--frames" => a.frames = val()?.parse().map_err(|_| "--frames が数値ではありません")?,
+            "--frames" => {
+                a.frames = val()?
+                    .parse()
+                    .map_err(|_| "--frames が数値ではありません")?
+            }
             "--bench" => a.bench = val()?.parse().map_err(|_| "--bench が数値ではありません")?,
             "--at" => a.shot_at = val()?.parse().map_err(|_| "--at が数値ではありません")?,
             "--term" => {
@@ -223,15 +231,15 @@ fn parse_args() -> Result<Args, String> {
 /// 標準ライブラリにタイムゾーンがないので `date` に聞き、
 /// 使えない環境では SL_UTC_OFFSET（既定 +9）で UTC からずらす。
 fn local_hour() -> f32 {
-    if let Ok(out) = std::process::Command::new("date").arg("+%H %M").output() {
-        if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout);
-            let mut it = s.split_whitespace();
-            if let (Some(h), Some(m)) = (it.next(), it.next()) {
-                if let (Ok(h), Ok(m)) = (h.parse::<f32>(), m.parse::<f32>()) {
-                    return (h + m / 60.0).rem_euclid(24.0);
-                }
-            }
+    if let Ok(out) = std::process::Command::new("date").arg("+%H %M").output()
+        && out.status.success()
+    {
+        let s = String::from_utf8_lossy(&out.stdout);
+        let mut it = s.split_whitespace();
+        if let (Some(h), Some(m)) = (it.next(), it.next())
+            && let (Ok(h), Ok(m)) = (h.parse::<f32>(), m.parse::<f32>())
+        {
+            return (h + m / 60.0).rem_euclid(24.0);
         }
     }
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -260,11 +268,7 @@ fn auto_ss(args: &Args, cols: usize, rows: usize) -> usize {
         .map(|n| n.get())
         .unwrap_or(1)
         .clamp(1, 16);
-    if px <= 56_000 * cores / 16 {
-        2
-    } else {
-        1
-    }
+    if px <= 56_000 * cores / 16 { 2 } else { 1 }
 }
 
 /// 書き出し用のレンダラ。`--term` があれば端末とまったく同じ格子で作る。
@@ -273,7 +277,11 @@ fn offline_renderer(args: &Args, default_px: (usize, usize)) -> Renderer {
         let (c, r) = (c.max(4), r.max(2));
         return Renderer::for_terminal(c, r, args.blocks, auto_ss(args, c, r));
     }
-    let (w, h) = if args.shot_w > 0 { (args.shot_w, args.shot_h) } else { default_px };
+    let (w, h) = if args.shot_w > 0 {
+        (args.shot_w, args.shot_h)
+    } else {
+        default_px
+    };
     let mut r = Renderer::new(w, h);
     r.set_px_aspect(1.0);
     r
@@ -323,7 +331,12 @@ fn build_view(cam: Cam, t: &Train, time: f32, fov_deg: f32, seed: u64, lift: f32
         Cam::Orbit => {
             let a = time * 0.22 + 1.2;
             let r = 24.0 + (time * 0.13).sin() * 5.0;
-            let eye = loco + v3(a.cos() * r - 4.0, 8.5 + (time * 0.19).sin() * 2.5, a.sin() * r);
+            let eye = loco
+                + v3(
+                    a.cos() * r - 4.0,
+                    8.5 + (time * 0.19).sin() * 2.5,
+                    a.sin() * r,
+                );
             (eye + shake(0.06, 0.5, 21.0), loco + v3(-2.5, 2.3, 0.0), fov)
         }
         Cam::Cab => {
@@ -339,7 +352,13 @@ fn build_view(cam: Cam, t: &Train, time: f32, fov_deg: f32, seed: u64, lift: f32
     let world_up = v3(0.0, 1.0, 0.0);
     let right = fwd.cross(world_up).norm();
     let up = right.cross(fwd);
-    View { eye, fwd, right, up, fov }
+    View {
+        eye,
+        fwd,
+        right,
+        up,
+        fov,
+    }
 }
 
 // ---------------------------------------------------------------- 1 フレーム
@@ -370,7 +389,7 @@ impl World {
         self.sky.wind = self.time * 6.0;
     }
 
-    fn draw(&mut self, r: &mut Renderer, view: &View, hud: bool) {
+    fn draw(&mut self, r: &mut Renderer, view: &View) {
         r.clear();
         r.cam_pos = view.eye;
         r.cam_right = view.right;
@@ -394,8 +413,6 @@ impl World {
         r.env.fire_pos = self.t.fire_pos();
         r.env.fire_power = (0.16 + night * 1.1) * (0.4 + self.t.throttle * 0.6);
 
-        self.sky.render(r, view.fwd, view.right, view.up, view.fov);
-
         // ---- ジオメトリ。
         {
             let mut b = Builder::new(r);
@@ -417,6 +434,10 @@ impl World {
                 b.pop();
             }
         }
+
+        // ---- 背景。物体を描いた後なので、隠れた画素は解かずに済む。
+        r.flush();
+        self.sky.render(r, view.fwd, view.right, view.up, view.fov);
 
         // ---- 遮蔽。煙を重ねる前に、不透明な面だけに効かせる。
         r.ssao(self.ao, 0.42);
@@ -442,7 +463,6 @@ impl World {
         self.smoke.draw_glow(r, &self.t, night);
 
         r.post();
-        let _ = hud;
     }
 }
 
@@ -467,7 +487,11 @@ fn main() {
 }
 
 fn run(args: Args) -> std::io::Result<()> {
-    let hour = if args.hour.is_nan() { local_hour() } else { args.hour.rem_euclid(24.0) };
+    let hour = if args.hour.is_nan() {
+        local_hour()
+    } else {
+        args.hour.rem_euclid(24.0)
+    };
 
     let mut w = World {
         t: Train::new(args.cars),
@@ -493,7 +517,7 @@ fn run(args: Args) -> std::io::Result<()> {
             w.step(dt, args.fly);
         }
         let view = build_view(args.cam, &w.t, w.time, args.fov, args.seed, w.fly * 6.5);
-        w.draw(&mut r, &view, false);
+        w.draw(&mut r, &view);
         std::fs::write(path, r.to_ppm())?;
         return Ok(());
     }
@@ -506,17 +530,24 @@ fn run(args: Args) -> std::io::Result<()> {
             w.t.headlight = smoothstep(0.30, 0.02, w.sky.day);
             w.step(dt, args.fly);
             let view = build_view(args.cam, &w.t, w.time, args.fov, args.seed, w.fly * 6.5);
-            w.draw(&mut r, &view, false);
+            w.draw(&mut r, &view);
             std::fs::write(format!("{prefix}{i:04}.ppm"), r.to_ppm())?;
         }
-        eprintln!("{} フレームを {}NNNN.ppm に書き出しました", args.frames, prefix);
+        eprintln!(
+            "{} フレームを {}NNNN.ppm に書き出しました",
+            args.frames, prefix
+        );
         return Ok(());
     }
 
     // ---- ベンチマーク。端末に触らず描画だけを回す。
     if args.bench > 0 {
         // ベンチは端末の桁数・行数で指定する（--size 200x50 = 200 桁 50 行）。
-        let (cols, rows) = if args.shot_w > 0 { (args.shot_w, args.shot_h) } else { (200, 50) };
+        let (cols, rows) = if args.shot_w > 0 {
+            (args.shot_w, args.shot_h)
+        } else {
+            (200, 50)
+        };
         let mut r = Renderer::for_terminal(cols, rows, args.blocks, auto_ss(&args, cols, rows));
         let mut buf = String::with_capacity(1 << 20);
         let dt = 1.0 / 60.0;
@@ -528,7 +559,7 @@ fn run(args: Args) -> std::io::Result<()> {
         for _ in 0..args.bench {
             w.step(dt, args.fly);
             let view = build_view(args.cam, &w.t, w.time, args.fov, args.seed, w.fly * 6.5);
-            w.draw(&mut r, &view, false);
+            w.draw(&mut r, &view);
             r.present(&mut buf, false);
         }
         let el = start.elapsed().as_secs_f64();
@@ -632,7 +663,7 @@ fn run(args: Args) -> std::io::Result<()> {
 
         // ---- 描画。
         let view = build_view(cam, &w.t, w.time, args.fov, args.seed, w.fly * 6.5);
-        w.draw(&mut r, &view, hud);
+        w.draw(&mut r, &view);
         r.present(&mut buf, false);
         out.write_all(buf.as_bytes())?;
 

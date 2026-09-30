@@ -154,7 +154,11 @@ truecolor のセルは 1 つ 20〜40 バイト使うので、30fps・200x50 で�
 | --- | --- |
 | `src/math.rs` | ベクトルと 4x4 行列 |
 | `src/noise.rs` | 値ノイズ、fbm、小型 PRNG |
-| `src/render.rs` | ラスタライザ、陰影、ブルーム、端末への出力 |
+| `src/render/mod.rs` | フレームバッファと素材・環境光の型 |
+| `src/render/raster.rs` | 三角形と煙スプライトのラスタライズ（横帯ごとに並列） |
+| `src/render/shade.rs` | 陰影・霧・影 |
+| `src/render/post.rs` | SSAO とブルーム |
+| `src/render/term.rs` | トーンマップ、四分割ブロックへの量子化、ANSI / PPM 出力 |
 | `src/mesh.rs` | 変換行列スタックとプリミティブ生成 |
 | `src/sky.rs` | 空・太陽・月・星・雲・山・地面（背景パス） |
 | `src/train.rs` | 機関車・炭水車・客車・線路・沿線 |

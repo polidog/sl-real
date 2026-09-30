@@ -3,7 +3,8 @@
 
 use crate::math::*;
 use crate::noise::{fbm2, hash2, noise2};
-use crate::render::{fog_of, shadow_of, Env, Renderer};
+use crate::render::{Env, Renderer, fog_of, shadow_of};
+use rayon::prelude::*;
 
 /// 時刻から決まる大気の状態。
 #[derive(Clone, Copy, Debug)]
@@ -25,10 +26,38 @@ pub struct Sky {
 
 const MOUNTAIN_LAYERS: [MountainLayer; 4] = [
     // 距離, 基準高, 起伏, ノイズ周波数, 色, 雪線
-    MountainLayer { dist: 5200.0, base: 260.0, amp: 620.0, freq: 0.00042, tint: v3(0.42, 0.47, 0.62), snow: 640.0 },
-    MountainLayer { dist: 2600.0, base: 120.0, amp: 300.0, freq: 0.00085, tint: v3(0.34, 0.41, 0.50), snow: 380.0 },
-    MountainLayer { dist: 1100.0, base: 40.0,  amp: 120.0, freq: 0.0020,  tint: v3(0.24, 0.32, 0.30), snow: 1e9 },
-    MountainLayer { dist: 420.0,  base: 6.0,   amp: 26.0,  freq: 0.0075,  tint: v3(0.16, 0.24, 0.17), snow: 1e9 },
+    MountainLayer {
+        dist: 5200.0,
+        base: 260.0,
+        amp: 620.0,
+        freq: 0.00042,
+        tint: v3(0.42, 0.47, 0.62),
+        snow: 640.0,
+    },
+    MountainLayer {
+        dist: 2600.0,
+        base: 120.0,
+        amp: 300.0,
+        freq: 0.00085,
+        tint: v3(0.34, 0.41, 0.50),
+        snow: 380.0,
+    },
+    MountainLayer {
+        dist: 1100.0,
+        base: 40.0,
+        amp: 120.0,
+        freq: 0.0020,
+        tint: v3(0.24, 0.32, 0.30),
+        snow: 1e9,
+    },
+    MountainLayer {
+        dist: 420.0,
+        base: 6.0,
+        amp: 26.0,
+        freq: 0.0075,
+        tint: v3(0.16, 0.24, 0.17),
+        snow: 1e9,
+    },
 ];
 
 #[derive(Clone, Copy)]
@@ -57,7 +86,8 @@ impl Sky {
         // 太陽自身の色。低いほど大気で赤く、弱くなる。
         let sun_hot = v3(1.0, 0.97, 0.92) * 1.55;
         let sun_low = v3(1.0, 0.45, 0.16) * 1.05;
-        let sun_color = sun_low.lerp(sun_hot, smoothstep(0.0, 0.55, se)) * saturate(se * 3.0 + 0.12);
+        let sun_color =
+            sun_low.lerp(sun_hot, smoothstep(0.0, 0.55, se)) * saturate(se * 3.0 + 0.12);
 
         let zenith_day = v3(0.038, 0.115, 0.44);
         let zenith_night = v3(0.0035, 0.006, 0.020);
@@ -97,7 +127,7 @@ impl Sky {
     }
 
     pub fn fog_density(&self) -> f32 {
-        lerp(0.00042, 0.00085, self.twilight) 
+        lerp(0.00042, 0.00085, self.twilight)
     }
 
     /// レンダラの環境光設定を、この空に合わせる。
@@ -192,7 +222,12 @@ impl Sky {
     }
 
     fn moon(&self, dir: V3) -> V3 {
-        let md = v3(-self.sun_dir.x, -self.sun_dir.y, self.sun_dir.z * 0.8 + 0.20).norm();
+        let md = v3(
+            -self.sun_dir.x,
+            -self.sun_dir.y,
+            self.sun_dir.z * 0.8 + 0.20,
+        )
+        .norm();
         if md.y < -0.1 {
             return V3::ZERO;
         }
@@ -213,8 +248,7 @@ impl Sky {
         let shade = lerp(0.72, 1.0, smoothstep(0.35, 0.62, mare));
         // 端に向かって少し暗くする。
         let limb = (1.0 - (u * u + v * v)).max(0.0).powf(0.22);
-        v3(0.95, 0.94, 0.88) * (disc * shade * limb * 1.9)
-            + v3(0.55, 0.60, 0.75) * 0.05
+        v3(0.95, 0.94, 0.88) * (disc * shade * limb * 1.9) + v3(0.55, 0.60, 0.75) * 0.05
     }
 
     /// 遠景の山並み。垂直な円筒との交点で視差を正しく出す。
@@ -256,12 +290,12 @@ impl Sky {
 
             // 斜面の向きから簡易的な陰影を作る。
             let e = 1.0 / l.freq * 0.02;
-            let nx = fbm2((hx + e) * l.freq, hz * l.freq, 4)
-                - fbm2((hx - e) * l.freq, hz * l.freq, 4);
+            let nx =
+                fbm2((hx + e) * l.freq, hz * l.freq, 4) - fbm2((hx - e) * l.freq, hz * l.freq, 4);
             let slope = nx * l.amp / (2.0 * e);
             let facing = saturate(0.5 - slope * 0.6 * self.sun_dir.x.signum());
-            let lit = lerp(0.05, 0.38, self.day)
-                + facing * 0.85 * saturate(self.sun_dir.y * 2.0 + 0.15);
+            let lit =
+                lerp(0.05, 0.38, self.day) + facing * 0.85 * saturate(self.sun_dir.y * 2.0 + 0.15);
 
             let mut col = l.tint * lit;
             // 雪。
@@ -298,7 +332,11 @@ impl Sky {
         let g1 = fbm2(x * 0.09, z * 0.09, 3);
         // ゆるやかな色むら（草の種類・刈り跡・乾き具合）。
         let patch = fbm2(x * 0.018 + 40.0, z * 0.018 - 12.0, 3);
-        let g2 = if lod > 0.02 { noise2(x * 0.9, z * 0.9) * lod } else { 0.0 };
+        let g2 = if lod > 0.02 {
+            noise2(x * 0.9, z * 0.9) * lod
+        } else {
+            0.0
+        };
         let grass = v3(0.030, 0.062, 0.014)
             .lerp(v3(0.072, 0.118, 0.026), g1)
             .lerp(v3(0.098, 0.082, 0.030), saturate(g2 * 0.5 - 0.1))
@@ -351,59 +389,40 @@ impl Sky {
     }
 
     /// 背景を書き込む。カメラ基底と垂直画角を渡す。
-    /// 1 ピクセルずつ独立なので、行の帯に分けて並列に解く。
+    ///
+    /// 不透明な物体を描いた後に呼ぶ。深度バッファで物体に隠れる画素を
+    /// 先に判定し、見えるところだけ空と地面を解く。
     pub fn render(&self, r: &mut Renderer, fwd: V3, right: V3, up: V3, fov_y: f32) {
+        let (w, h) = (r.w, r.h);
+        if w == 0 || h == 0 {
+            return;
+        }
         let cam = r.cam_pos;
         let th = (fov_y * 0.5).tan();
         let aspect = r.aspect();
-        let (w, h) = (r.w, r.h);
-        let env = r.env;
-        let boxes = std::mem::take(&mut r.shadow_boxes);
-
-        if w == 0 || h == 0 {
-            r.shadow_boxes = boxes;
-            return;
-        }
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .min(h.max(1))
-            .min(16);
-        let band = h.div_ceil(threads.max(1)).max(1);
-
-        let sky = *self;
-        let boxes_ref: &[(V3, V3)] = &boxes;
-        std::thread::scope(|scope| {
-            let mut y0 = 0usize;
-            for (cc, dd) in r
-                .color
-                .chunks_mut(w * band)
-                .zip(r.depth.chunks_mut(w * band))
-            {
-                let start = y0;
-                y0 += band;
-                scope.spawn(move || {
-                    for (i, (cp, dp)) in cc.iter_mut().zip(dd.iter_mut()).enumerate() {
-                        let py = start + i / w;
-                        let px = i % w;
-                        let ndc_y = 1.0 - (py as f32 + 0.5) / h as f32 * 2.0;
-                        let ndc_x = (px as f32 + 0.5) / w as f32 * 2.0 - 1.0;
-                        let dir =
-                            (fwd + right * (ndc_x * th * aspect) + up * (ndc_y * th)).norm();
-                        let (col, depth) = if dir.y < -1e-4 && cam.y > 0.0 {
-                            let t = -cam.y / dir.y;
-                            let p = cam + dir * t;
-                            (sky.ground_color(p, t, &env, boxes_ref, dir), t * dir.dot(fwd))
-                        } else {
-                            (sky.sky_color(dir, cam), f32::INFINITY)
-                        };
-                        *cp = col;
+        let env = &r.env;
+        let boxes: &[(V3, V3)] = &r.shadow_boxes;
+        r.color
+            .par_chunks_mut(w)
+            .zip(r.depth.par_chunks_mut(w))
+            .enumerate()
+            .for_each(|(py, (crow, drow))| {
+                let ndc_y = 1.0 - (py as f32 + 0.5) / h as f32 * 2.0;
+                for (px, (cp, dp)) in crow.iter_mut().zip(drow.iter_mut()).enumerate() {
+                    let ndc_x = (px as f32 + 0.5) / w as f32 * 2.0 - 1.0;
+                    let dir = (fwd + right * (ndc_x * th * aspect) + up * (ndc_y * th)).norm();
+                    if dir.y < -1e-4 && cam.y > 0.0 {
+                        let t = -cam.y / dir.y;
+                        let depth = t * dir.dot(fwd);
+                        if depth >= *dp {
+                            continue;
+                        }
+                        *cp = self.ground_color(cam + dir * t, t, env, boxes, dir);
                         *dp = depth;
+                    } else if dp.is_infinite() {
+                        *cp = self.sky_color(dir, cam);
                     }
-                });
-            }
-        });
-
-        r.shadow_boxes = boxes;
+                }
+            });
     }
 }
