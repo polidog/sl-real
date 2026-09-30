@@ -53,18 +53,18 @@
   夜に灯る客車の室内灯、バネ上の揺れ、煤と錆の汚れ、リベット、
   ブルームなど。
 
-## ビルド
+## インストール
+
+```sh
+cargo install sl-real
+alias sl=sl-real   # sl として使うなら
+```
+
+手元でビルドするなら:
 
 ```sh
 cargo build --release
 ./target/release/sl-real
-```
-
-`sl` として使うなら:
-
-```sh
-cargo install --path .
-alias sl=sl-real
 ```
 
 ## 使い方
@@ -164,3 +164,7 @@ truecolor のセルは 1 つ 20〜40 バイト使うので、30fps・200x50 で�
 | `src/train.rs` | 機関車・炭水車・客車・線路・沿線 |
 | `src/smoke.rs` | 煙と蒸気のパーティクル |
 | `src/main.rs` | 引数、カメラ、メインループ |
+
+## ライセンス
+
+[MIT](LICENSE-MIT) または [Apache-2.0](LICENSE-APACHE) のどちらかを選んで使えます。

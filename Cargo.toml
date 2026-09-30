@@ -2,6 +2,14 @@
 name = "sl-real"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "端末を走る 3D 蒸気機関車。sl をソフトウェアラスタライザで本気にしたもの"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/polidog/sl-real"
+readme = "README.md"
+keywords = ["sl", "terminal", "train", "3d", "ascii-art"]
+categories = ["command-line-utilities", "games", "rendering"]
+exclude = ["docs/"]
 
 [dependencies]
 crossterm = "0.29.0"
